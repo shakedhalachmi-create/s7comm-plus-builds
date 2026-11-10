@@ -50,7 +50,7 @@ jobs:
       src_sha: ${{ steps.src.outputs.sha }}
       tag: ${{ steps.src.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve plugin source (upstream, else backup fork)
         id: src
@@ -181,7 +181,7 @@ jobs:
 
       - name: Cache Wireshark Windows libraries
         if: matrix.os == 'windows'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: C:/wireshark-libs
           key: wslibs-${{ matrix.platform }}-${{ matrix.ws_minor }}-${{ hashFiles('ws/cmake/modules/FetchArtifacts.cmake', 'ws/tools/win-setup.ps1') }}
@@ -227,7 +227,12 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
-          ws/tools/macos-setup-brew.sh --install-required
+          # 4.6+ needs --install-required; 4.4 installs the required set by default and rejects the flag.
+          if grep -q -- '--install-required)' ws/tools/macos-setup-brew.sh; then
+            ws/tools/macos-setup-brew.sh --install-required
+          else
+            ws/tools/macos-setup-brew.sh
+          fi
           brew install ninja || true
 
       - name: Configure and build (Linux / macOS)
@@ -250,7 +255,7 @@ jobs:
           cp "$f" "out/${{ matrix.asset }}"
           ls -la out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: out/${{ matrix.asset }}
@@ -262,7 +267,7 @@ jobs:
     if: always() && needs.plan.outputs.count != '0' && needs.plan.result == 'success'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
