@@ -1,0 +1,294 @@
+name: Build S7CommPlus plugin
+
+# Builds the S7CommPlus dissector (Thomas Wiens, packet-s7comm_plus.c) as a
+# Wireshark plugin for several Wireshark versions and platforms, and publishes
+# the results as a GitHub release named after the plugin source commit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "Wireshark minor versions, space separated (empty = wireshark-versions.txt)"
+        required: false
+        default: ""
+      platforms:
+        description: "Platforms, space separated, or 'all' (windows-x64 windows-arm64 linux-x64 linux-arm64 macos-arm64)"
+        required: false
+        default: "all"
+      force:
+        description: "Rebuild even if the release already has the file"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 3 * * 1"   # every Monday 03:00 UTC: pick up new plugin commits and Wireshark patch releases
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build.yml"
+      - "wireshark-versions.txt"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: JuergenKosel/s7commwireshark
+  BACKUP_REPO: shakedhalachmi-create/s7commwireshark
+  SOURCE_BRANCH: local-trunk
+
+jobs:
+  plan:
+    name: Plan builds
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      src_repo: ${{ steps.src.outputs.repo }}
+      src_sha: ${{ steps.src.outputs.sha }}
+      tag: ${{ steps.src.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve plugin source (upstream, else backup fork)
+        id: src
+        run: |
+          set -euo pipefail
+          for repo in "$UPSTREAM_REPO" "$BACKUP_REPO"; do
+            sha=$(git ls-remote "https://github.com/$repo.git" "refs/heads/$SOURCE_BRANCH" 2>/dev/null | cut -f1 || true)
+            if [ -n "$sha" ]; then
+              echo "Using $repo @ $sha"
+              echo "repo=$repo" >> "$GITHUB_OUTPUT"
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+              echo "tag=s7cp-${sha:0:7}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::$repo is not reachable"
+          done
+          echo "::error::No plugin source repository is reachable"
+          exit 1
+
+      - name: Build the matrix
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_VERSIONS: ${{ github.event.inputs.versions }}
+          IN_PLATFORMS: ${{ github.event.inputs.platforms }}
+          IN_FORCE: ${{ github.event.inputs.force }}
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ steps.src.outputs.tag }}
+        run: |
+          set -euo pipefail
+          versions="${IN_VERSIONS:-}"
+          [ -z "$versions" ] && versions=$(grep -Ev '^\s*(#|$)' wireshark-versions.txt | tr '\n' ' ')
+          platforms="${IN_PLATFORMS:-all}"
+          [ "$platforms" = "all" ] && platforms="windows-x64 windows-arm64 linux-x64 linux-arm64 macos-arm64"
+
+          # Latest patch tag for every requested minor version.
+          git ls-remote --tags --refs https://gitlab.com/wireshark/wireshark.git 'refs/tags/v*' \
+            | sed 's#.*refs/tags/##' > all_tags.txt
+          : > ws_tags.txt
+          for v in $versions; do
+            t=$(grep -E "^v${v//./\\.}\.[0-9]+$" all_tags.txt | sort -V | tail -1 || true)
+            if [ -z "$t" ]; then echo "::warning::No release tag for Wireshark $v"; continue; fi
+            echo "Wireshark $v -> $t"
+            echo "$t" >> ws_tags.txt
+          done
+
+          # Files already in the release for this plugin commit (skipped unless forced / config changed).
+          gh release view "$TAG" --json assets -q '.assets[].name' > existing.txt 2>/dev/null || : > existing.txt
+          skip_existing=true
+          if [ "$EVENT" = "push" ] || [ "${IN_FORCE:-false}" = "true" ]; then skip_existing=false; fi
+
+          python3 - "$platforms" "$skip_existing" <<'EOF'
+          import json, os, sys
+          platforms = sys.argv[1].split()
+          skip_existing = sys.argv[2] == "true"
+          runners = {
+              "windows-x64":   ("windows-2022",      "windows", "x64",   "dll"),
+              "windows-arm64": ("windows-11-arm",    "windows", "arm64", "dll"),
+              "linux-x64":     ("ubuntu-24.04",      "linux",   "x64",   "so"),
+              "linux-arm64":   ("ubuntu-24.04-arm",  "linux",   "arm64", "so"),
+              "macos-arm64":   ("macos-15",          "macos",   "arm64", "so"),
+          }
+          existing = set(open("existing.txt").read().split())
+          tags = open("ws_tags.txt").read().split()
+          include = []
+          for tag in tags:
+              ver = tag[1:]
+              minor = ".".join(ver.split(".")[:2])
+              for p in platforms:
+                  if p not in runners:
+                      print(f"::warning::Unknown platform {p}")
+                      continue
+                  runner, os_name, arch, ext = runners[p]
+                  asset = f"s7comm_plus-wireshark{ver}-{p}.{ext}"
+                  if skip_existing and asset in existing:
+                      print(f"skip {asset} (already released)")
+                      continue
+                  include.append(dict(ws_tag=tag, ws_version=ver, ws_minor=minor,
+                                      platform=p, runner=runner, os=os_name,
+                                      arch=arch, ext=ext, asset=asset))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("matrix=" + json.dumps({"include": include}) + "\n")
+              out.write(f"count={len(include)}\n")
+          print(json.dumps(include, indent=1))
+          EOF
+
+  build:
+    name: ${{ matrix.platform }} / Wireshark ${{ matrix.ws_version }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      CMAKE_FLAGS: >-
+        -DBUILD_wireshark=OFF -DBUILD_stratoshark=OFF -DBUILD_logray=OFF
+        -DENABLE_WERROR=OFF
+        -DCUSTOM_PLUGIN_SRC_DIR=plugins/epan/s7comm_plus
+        -DBUILD_androiddump=OFF -DBUILD_sshdump=OFF -DBUILD_ciscodump=OFF
+        -DBUILD_wifidump=OFF -DBUILD_randpktdump=OFF -DBUILD_etwdump=OFF
+        -DBUILD_udpdump=OFF -DBUILD_sdjournal=OFF -DBUILD_dpauxmon=OFF
+    steps:
+      - name: Get Wireshark ${{ matrix.ws_tag }}
+        shell: bash
+        run: git clone --quiet --depth 1 --branch "${{ matrix.ws_tag }}" https://gitlab.com/wireshark/wireshark.git ws
+
+      - name: Get plugin source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet "https://github.com/${{ needs.plan.outputs.src_repo }}.git" plugin-src
+          git -C plugin-src checkout --quiet "${{ needs.plan.outputs.src_sha }}"
+          cp -r plugin-src/src/s7comm_plus ws/plugins/epan/s7comm_plus
+
+      # ---------------- Windows ----------------
+      - name: Windows tools
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: choco install -y --no-progress winflexbison3
+
+      - name: MSVC environment
+        if: matrix.os == 'windows'
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Cache Wireshark Windows libraries
+        if: matrix.os == 'windows'
+        uses: actions/cache@v4
+        with:
+          path: C:/wireshark-libs
+          key: wslibs-${{ matrix.platform }}-${{ matrix.ws_minor }}-${{ hashFiles('ws/cmake/modules/FetchArtifacts.cmake', 'ws/tools/win-setup.ps1') }}
+          restore-keys: wslibs-${{ matrix.platform }}-${{ matrix.ws_minor }}-
+
+      - name: Configure (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          WIRESHARK_BASE_DIR: C:/wireshark-libs
+          PLATFORM: ${{ matrix.arch }}
+          WIRESHARK_TARGET_PLATFORM: ${{ matrix.arch }}
+        run: |
+          $arch = if ('${{ matrix.arch }}' -eq 'arm64') { 'ARM64' } else { 'x64' }
+          New-Item -ItemType Directory -Force build | Out-Null
+          cmake -S ws -B build -A $arch $env:CMAKE_FLAGS.Split(' ')
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          cmake --build build --config RelWithDebInfo --target s7comm_plus --parallel
+          if ($LASTEXITCODE) {
+            Write-Host "::warning::Parallel build failed, retrying serially"
+            cmake --build build --config RelWithDebInfo --target s7comm_plus
+          }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # ---------------- Linux ----------------
+      - name: Linux dependencies
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo ws/tools/debian-setup.sh ninja-build -y
+
+      # ---------------- macOS ----------------
+      - name: macOS dependencies
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          ws/tools/macos-setup-brew.sh --install-required
+          brew install ninja || true
+
+      - name: Configure and build (Linux / macOS)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S ws -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo $CMAKE_FLAGS
+          cmake --build build --target s7comm_plus
+
+      # ---------------- Package ----------------
+      - name: Collect plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=$(find build/run -type f \( -name 's7comm_plus.dll' -o -name 's7comm_plus.so' \) | head -1)
+          if [ -z "$f" ]; then echo "::error::Plugin binary not found"; find build/run -maxdepth 6 | head -50; exit 1; fi
+          echo "Built: $f"
+          mkdir -p out
+          cp "$f" "out/${{ matrix.asset }}"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [plan, build]
+    if: always() && needs.plan.outputs.count != '0' && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          SRC_REPO: ${{ needs.plan.outputs.src_repo }}
+          SRC_SHA: ${{ needs.plan.outputs.src_sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then echo "::warning::Nothing was built successfully"; exit 0; fi
+          ls -la dist
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            cat > notes.md <<EOF
+          S7CommPlus Wireshark dissector by Thomas Wiens, built from
+          [$SRC_REPO@${SRC_SHA:0:7}](https://github.com/$SRC_REPO/tree/$SRC_SHA) (GPL-2.0-or-later).
+
+          File names: \`s7comm_plus-wireshark<VERSION>-<PLATFORM>.<dll|so>\`.
+          Pick the file whose Wireshark major.minor version (for example 4.6) and platform match
+          your installed Wireshark, rename it to \`s7comm_plus.dll\` (Windows) or \`s7comm_plus.so\`
+          (Linux/macOS), and see the README for where to put it.
+          EOF
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "S7CommPlus plugin ${SRC_SHA:0:7}" --notes-file notes.md
+          fi
+          gh release upload "$TAG" "${files[@]}" -R "$GITHUB_REPOSITORY" --clobber
