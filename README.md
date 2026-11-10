@@ -39,7 +39,8 @@ To check your version, open Help > About Wireshark. On Windows, see which build 
 
 1. Rename the file to `s7comm_plus.dll` (Windows) or `s7comm_plus.so` (Linux/macOS).
 2. In Wireshark, open Help > About Wireshark > Folders and double-click **Personal Plugins**.
-   It points to `.../plugins/<major.minor>`.
+   It points to `.../plugins/<major.minor>`, for example `plugins/4.6`. On macOS the folder
+   name uses a dash instead, for example `plugins/4-6`.
 3. Inside it, create a folder named `epan` and copy the file into it.
 4. Restart Wireshark. *Reload Lua Plugins* is not enough for binary plugins.
 5. Check that `s7comm_plus` appears under Help > About Wireshark > Plugins, and that the display
